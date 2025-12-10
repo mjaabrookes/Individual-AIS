@@ -195,7 +195,7 @@ def select_navigation_mode(robot):
 
 #Initial 360 scan
 def initial_scan(robot):
-    print("\n[SCANNING FOR WALLS]")
+    print("\nScanning for walls")
     for _ in range(18):
         if len(marked_walls_seen) >= 2:
             break
@@ -260,7 +260,7 @@ def wall_following_behaviour(robot):
         robot.stop_all_motors()
 
 def exploration_behaviour(robot):
-    print("  [EXPLORATION]")
+    print("  Exploration")
     
     #Look for cubes
     for obj in robot.world.visible_objects:
@@ -283,7 +283,7 @@ def exploration_behaviour(robot):
         move_particles(0, 0, math.radians(90))
 
 def target_seeking_behaviour(robot):
-    print("  [TARGET_SEEKING]")
+    print("  Target Seeking")
     
     visible_cubes = [obj for obj in robot.world.visible_objects 
                      if isinstance(obj, cozmo.objects.LightCube) 
@@ -331,7 +331,7 @@ def main(robot: cozmo.robot.Robot):
         relocalise(robot)
     
     #Main loop
-    print("\n[MISSION START]\n")
+    print("\nStarting\n")
     start_time = time.time()
     iteration = 0
     
@@ -358,7 +358,7 @@ def main(robot: cozmo.robot.Robot):
         elif current_mode == NavigationMode.TARGET_SEEKING:
             target_seeking_behaviour(robot)
             if len(cubes_collected) >= 3:
-                print("\n[SUCCESS] All cubes collected!")
+                print("\nAll cubes have been collected!")
                 break
         elif current_mode == NavigationMode.WALL_FOLLOWING:
             wall_following_behaviour(robot)
