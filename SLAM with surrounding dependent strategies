@@ -316,7 +316,7 @@ def target_seeking_behaviour(robot):
         move_particles(-100, 0, 0)
         
     except cozmo.exceptions.RobotBusy:
-        print("    Robot busy, retrying...")
+        print("    Robot busy, reattempting")
     except:
         print("    Failed to pick up cube")
         #Try to recover
