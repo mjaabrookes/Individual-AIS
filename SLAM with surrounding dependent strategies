@@ -1,0 +1,386 @@
+import cozmo
+import math
+import time
+import numpy as np
+from enum import Enum
+from cozmo.util import degrees, distance_mm, speed_mmps, Angle
+from cozmo.objects import CustomObject, CustomObjectMarkers, CustomObjectTypes
+
+#Wall positions from lab setup
+WALL_POSITIONS = {
+    'wall1': (0, 122),
+    'wall2': (122, 122)
+}
+
+MARKER_TO_WALL = {
+    'CustomType01': 'wall1',
+    'CustomType02': 'wall2'
+}
+
+class NavigationMode(Enum):
+    EXPLORATION = 1
+    WALL_FOLLOWING = 2
+    TARGET_SEEKING = 3
+    RECOVERY = 4
+
+#Global variables
+particles = None
+weights = None
+num_particles = 500
+
+walls = []
+marked_walls_seen = []
+wall_assignments = {}
+cubes_found = []
+cubes_collected = []
+current_mode = NavigationMode.EXPLORATION
+
+#Particle filter functions
+def fix_angle(angle):
+    #keep angle between -pi and pi
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
+def init_particles():
+    global particles, weights
+    #random particles in the space
+    particles = np.random.uniform(
+        low=[-100, -100, -np.pi],
+        high=[400, 400, np.pi],
+        size=(num_particles, 3)
+    )
+    weights = np.ones(num_particles) / num_particles
+    print("Particles initialised")
+
+def move_particles(delta_x, delta_y, delta_theta):
+    global particles
+    noise_x, noise_y, noise_theta = 15, 15, 0.15
+    
+    for i in range(num_particles):
+        particles[i, 0] += delta_x + np.random.normal(0, noise_x)
+        particles[i, 1] += delta_y + np.random.normal(0, noise_y)
+        particles[i, 2] += delta_theta + np.random.normal(0, noise_theta)
+        particles[i, 2] = fix_angle(particles[i, 2])
+
+def update_particle_weights(measurements, wall_positions):
+    global particles, weights
+    sigma_dist = 25
+    sigma_bearing = 0.2
+    
+    for i in range(num_particles):
+        x, y, theta = particles[i]
+        likelihood = 1.0
+        
+        for (measured_dist, measured_bearing), (wall_x, wall_y) in zip(measurements, wall_positions):
+            dx = wall_x - x
+            dy = wall_y - y
+            expected_dist = np.sqrt(dx**2 + dy**2)
+            expected_bearing = fix_angle(np.arctan2(dy, dx) - theta)
+            
+            dist_error = measured_dist - expected_dist
+            bearing_error = fix_angle(measured_bearing - expected_bearing)
+            
+            #Gaussian probability
+            likelihood *= np.exp(-0.5 * (dist_error / sigma_dist)**2)
+            likelihood *= np.exp(-0.5 * (bearing_error / sigma_bearing)**2)
+        
+        weights[i] = likelihood
+    
+    #Normalise weights
+    total = np.sum(weights)
+    if total > 0:
+        weights = weights / total
+    else:
+        weights = np.ones(num_particles) / num_particles
+
+def resample_particles():
+    global particles, weights
+    indices = np.random.choice(num_particles, size=num_particles, p=weights)
+    particles = particles[indices]
+    weights = np.ones(num_particles) / num_particles
+
+def get_particle_estimate():
+    global particles, weights
+    #Weighted average
+    x = np.sum(weights * particles[:, 0])
+    y = np.sum(weights * particles[:, 1])
+    #Circular mean for angle
+    cos_sum = np.sum(weights * np.cos(particles[:, 2]))
+    sin_sum = np.sum(weights * np.sin(particles[:, 2]))
+    theta = np.arctan2(sin_sum, cos_sum)
+    return x, y, theta
+
+def get_particle_uncertainty():
+    global particles, weights
+    mean_x, mean_y, mean_theta = get_particle_estimate()
+    var_x = np.sum(weights * (particles[:, 0] - mean_x)**2)
+    var_y = np.sum(weights * (particles[:, 1] - mean_y)**2)
+    return np.sqrt(var_x), np.sqrt(var_y)
+
+#Setup wall markers
+def create_cozmo_walls(robot):
+    types = [CustomObjectTypes.CustomType01, CustomObjectTypes.CustomType02,
+             CustomObjectTypes.CustomType03, CustomObjectTypes.CustomType04]
+    markers = [CustomObjectMarkers.Circles2, CustomObjectMarkers.Diamonds2,
+               CustomObjectMarkers.Hexagons2, CustomObjectMarkers.Triangles2]
+    
+    for i in range(4):
+        robot.world.define_custom_wall(types[i], markers[i], 200, 60, 50, 50, True)
+
+def handle_object_observed(evt, **kw):
+    global walls, marked_walls_seen, wall_assignments
+    
+    if isinstance(evt.obj, CustomObject) and evt.obj not in marked_walls_seen:
+        full_type = str(evt.obj.object_type)
+        marker_type = full_type.split('.')[-1]
+        
+        if marker_type in MARKER_TO_WALL:
+            wall_key = MARKER_TO_WALL[marker_type]
+            fixed_position = WALL_POSITIONS[wall_key]
+            marked_walls_seen.append(evt.obj)
+            wall_assignments[evt.obj] = (wall_key, fixed_position)
+            walls.append(fixed_position)
+            print(f"  Found {marker_type} at {fixed_position}")
+
+def measure_wall(robot, marker_obj):
+    #Take multiple measurements and average
+    distances = []
+    bearings = []
+    
+    for _ in range(5):
+        dx = marker_obj.pose.position.x - robot.pose.position.x
+        dy = marker_obj.pose.position.y - robot.pose.position.y
+        dist = math.sqrt(dx*dx + dy*dy)
+        global_bearing = math.atan2(dy, dx)
+        rel_bearing = fix_angle(global_bearing - robot.pose.rotation.angle_z.radians)
+        distances.append(dist)
+        bearings.append(rel_bearing)
+        time.sleep(0.05)
+    
+    #Median distance
+    final_dist = sorted(distances)[len(distances) // 2]
+    #Circular mean for bearing
+    avg_x = sum(math.cos(b) for b in bearings) / len(bearings)
+    avg_y = sum(math.sin(b) for b in bearings) / len(bearings)
+    final_bearing = math.atan2(avg_y, avg_x)
+    
+    return final_dist, final_bearing
+
+#Mode selection based on uncertainty
+def select_navigation_mode(robot):
+    global current_mode
+    
+    std_x, std_y = get_particle_uncertainty()
+    uncertainty = math.sqrt(std_x**2 + std_y**2)
+    
+    #Check for visible cubes
+    visible_cubes = [obj for obj in robot.world.visible_objects 
+                     if isinstance(obj, cozmo.objects.LightCube) 
+                     and obj not in cubes_collected]
+    
+    #Priority order for mode selection
+    if uncertainty > 80:
+        return NavigationMode.RECOVERY
+    
+    if visible_cubes:
+        return NavigationMode.TARGET_SEEKING
+    
+    if uncertainty > 40:
+        return NavigationMode.WALL_FOLLOWING
+    
+    return NavigationMode.EXPLORATION
+
+#Initial 360 scan
+def initial_scan(robot):
+    print("\n[SCANNING FOR WALLS]")
+    for _ in range(18):
+        if len(marked_walls_seen) >= 2:
+            break
+        robot.turn_in_place(degrees(20)).wait_for_completed()
+        move_particles(0, 0, math.radians(20))
+        time.sleep(0.2)
+    print(f"Found {len(marked_walls_seen)} walls\n")
+
+#Use walls to improve position estimate
+def relocalise(robot):
+    if len(marked_walls_seen) < 2:
+        return
+    
+    visible_markers = [m for m in marked_walls_seen if m.is_visible]
+    if len(visible_markers) >= 2:
+        measurements = []
+        wall_positions = []
+        
+        for marker in visible_markers[:2]:
+            dist, bearing = measure_wall(robot, marker)
+            measurements.append((dist, bearing))
+            wall_key, wall_pos = wall_assignments[marker]
+            wall_positions.append(wall_pos)
+        
+        update_particle_weights(measurements, wall_positions)
+        resample_particles()
+        std_x, std_y = get_particle_uncertainty()
+        print(f"  Relocalised: uncertainty now {math.sqrt(std_x**2 + std_y**2):.0f}mm")
+
+def recovery_behaviour(robot):
+    print("Scanning")
+    for _ in range(8):
+        robot.turn_in_place(degrees(45)).wait_for_completed()
+        move_particles(0, 0, math.radians(45))
+        time.sleep(0.2)
+    relocalise(robot)
+
+def wall_following_behaviour(robot):
+    print("Following a wall")
+    
+    #Check for cubes
+    for obj in robot.world.visible_objects:
+        if isinstance(obj, cozmo.objects.LightCube) and obj not in cubes_found:
+            cubes_found.append(obj)
+            print(f"    Found cube {obj.cube_id}!")
+            return
+    
+    #Simple wall following - curves right
+    try:
+        robot.drive_wheels(30, 35)
+        time.sleep(0.5)
+        robot.stop_all_motors()
+        
+        #Update particles with movement
+        delta = 30 * 0.5
+        move_particles(delta * math.cos(0.1), delta * math.sin(0.1), 0.1)
+        
+        #Sometimes relocalise
+        if np.random.random() < 0.3:
+            relocalise(robot)
+    except:
+        robot.stop_all_motors()
+
+def exploration_behaviour(robot):
+    print("  [EXPLORATION]")
+    
+    #Look for cubes
+    for obj in robot.world.visible_objects:
+        if isinstance(obj, cozmo.objects.LightCube) and obj not in cubes_found:
+            cubes_found.append(obj)
+            print(f"    Found cube {obj.cube_id}!")
+            return
+    
+    #Randomly walk
+    try:
+        robot.drive_straight(distance_mm(80), speed_mmps(50)).wait_for_completed()
+        move_particles(80, 0, 0)
+        
+        turn_angle = np.random.uniform(-45, 45)
+        robot.turn_in_place(degrees(turn_angle)).wait_for_completed()
+        move_particles(0, 0, math.radians(turn_angle))
+    except:
+        #Hit something, turning away
+        robot.turn_in_place(degrees(90)).wait_for_completed()
+        move_particles(0, 0, math.radians(90))
+
+def target_seeking_behaviour(robot):
+    print("  [TARGET_SEEKING]")
+    
+    visible_cubes = [obj for obj in robot.world.visible_objects 
+                     if isinstance(obj, cozmo.objects.LightCube) 
+                     and obj not in cubes_collected]
+    
+    if not visible_cubes:
+        return
+    
+    target = visible_cubes[0]
+    
+    try:
+        #Go to cube
+        robot.go_to_object(target, distance_mm(50)).wait_for_completed()
+        cubes_collected.append(target)
+        print(f"    COLLECTED cube {target.cube_id}!")
+        #Back up
+        robot.drive_straight(distance_mm(-80), speed_mmps(50)).wait_for_completed()
+        move_particles(-80, 0, 0)
+    except:
+        print("    Failed to reach cube")
+
+#Main program
+def main(robot: cozmo.robot.Robot):
+    global current_mode
+    
+    print("\n" + "="*60)
+    print("ADAPTIVE SEARCH AND RESCUE")
+    print("="*60)
+    
+    #Setup
+    robot.camera.image_stream_enabled = True
+    create_cozmo_walls(robot)
+    robot.add_event_handler(cozmo.objects.EvtObjectObserved, handle_object_observed)
+    robot.set_head_angle(Angle(0)).wait_for_completed()
+    
+    #Initialise particle filter
+    init_particles()
+    time.sleep(1)
+    
+    #Scan for walls
+    initial_scan(robot)
+    
+    #Relocalise if we found walls
+    if len(marked_walls_seen) >= 2:
+        relocalise(robot)
+    
+    #Main loop
+    print("\n[MISSION START]\n")
+    start_time = time.time()
+    iteration = 0
+    
+    while time.time() - start_time < 90:
+        iteration += 1
+        elapsed = time.time() - start_time
+        
+        print(f"\n--- Iteration {iteration} ({elapsed:.0f}s) ---")
+        print(f"  Found: {len(cubes_found)}, Collected: {len(cubes_collected)}")
+        
+        #Select mode based on uncertainty
+        new_mode = select_navigation_mode(robot)
+        if new_mode != current_mode:
+            current_mode = new_mode
+        
+        std_x, std_y = get_particle_uncertainty()
+        est_x, est_y, est_theta = get_particle_estimate()
+        print(f"  Mode: {current_mode.name}")
+        print(f"  Position: ({est_x:.0f}, {est_y:.0f}), Uncertainty: {math.sqrt(std_x**2 + std_y**2):.0f}mm")
+        
+        #run behaviour
+        if current_mode == NavigationMode.RECOVERY:
+            recovery_behaviour(robot)
+        elif current_mode == NavigationMode.TARGET_SEEKING:
+            target_seeking_behaviour(robot)
+            if len(cubes_collected) >= 3:
+                print("\n[SUCCESS] All cubes collected!")
+                break
+        elif current_mode == NavigationMode.WALL_FOLLOWING:
+            wall_following_behaviour(robot)
+        else:
+            exploration_behaviour(robot)
+        
+        time.sleep(0.5)
+    
+    #Print results
+    mission_time = time.time() - start_time
+    print("\n" + "="*60)
+    print("MISSION COMPLETE")
+    print("="*60)
+    print(f"Time: {mission_time:.1f}s")
+    print(f"Cubes found: {len(cubes_found)}")
+    print(f"Cubes collected: {len(cubes_collected)}")
+    print(f"Collection rate: {len(cubes_collected)/3*100:.0f}%")
+    
+    final_x, final_y, final_theta = get_particle_estimate()
+    std_x, std_y = get_particle_uncertainty()
+    print(f"\nFinal position: ({final_x:.0f}, {final_y:.0f})")
+    print(f"Final uncertainty: {math.sqrt(std_x**2 + std_y**2):.0f}mm")
+
+if __name__ == "__main__":
+    cozmo.run_program(main)
