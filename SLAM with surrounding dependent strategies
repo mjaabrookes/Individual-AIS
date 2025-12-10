@@ -295,15 +295,34 @@ def target_seeking_behaviour(robot):
     target = visible_cubes[0]
     
     try:
-        #Go to cube
-        robot.go_to_object(target, distance_mm(50)).wait_for_completed()
+        #Approach and pick up cube
+        print(f"    Approaching cube {target.cube_id}")
+        robot.pickup_object(target, num_retries=2).wait_for_completed()
+        
         cubes_collected.append(target)
         print(f"    COLLECTED cube {target.cube_id}!")
-        #Back up
+        
+        #Lift the cube to show success
+        robot.set_lift_height(1.0, duration=0.5).wait_for_completed()
+        time.sleep(0.3)
+        
+        #Put cube down
+        robot.place_object_on_ground_here(target).wait_for_completed()
+        print(f"    Placed cube {target.cube_id} down")
+        
+        #Back up and lower lift
+        robot.set_lift_height(0.0, duration=0.5).wait_for_completed()
+        robot.drive_straight(distance_mm(-100), speed_mmps(50)).wait_for_completed()
+        move_particles(-100, 0, 0)
+        
+    except cozmo.exceptions.RobotBusy:
+        print("    Robot busy, retrying...")
+    except:
+        print("    Failed to pick up cube")
+        #Try to recover
+        robot.set_lift_height(0.0).wait_for_completed()
         robot.drive_straight(distance_mm(-80), speed_mmps(50)).wait_for_completed()
         move_particles(-80, 0, 0)
-    except:
-        print("    Failed to reach cube")
 
 #Main program
 def main(robot: cozmo.robot.Robot):
