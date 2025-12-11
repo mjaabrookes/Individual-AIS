@@ -243,9 +243,9 @@ def wall_following_behaviour(robot):
             print(f"    Found cube {obj.cube_id}!")
             return
     
-    #Simple wall following - curves right
+    #Simple wall following, curves left
     try:
-        robot.drive_wheels(30, 35)
+        robot.drive_wheels(35, 30)
         time.sleep(0.5)
         robot.stop_all_motors()
         
